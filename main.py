@@ -76,6 +76,8 @@ from kiro.config import (
     MULTI_TENANT_ENABLED,
     TENANT_DB_PATH,
     ADMIN_API_TOKEN,
+    CREDENTIAL_POOL_ENABLED,
+    CREDENTIAL_POOL_STRATEGY,
     _warn_timeout_configuration,
 )
 from kiro.auth import KiroAuthManager
@@ -432,10 +434,29 @@ async def lifespan(app: FastAPI):
         app.state.rate_limiter = RateLimiter()
         logger.info(f"Multi-tenant enabled (db: {TENANT_DB_PATH})")
 
+    # --- Credential Pool Initialization ---
+    if CREDENTIAL_POOL_ENABLED:
+        from kiro.multi_tenant.credential_pool import CredentialPool, PoolStrategy
+        try:
+            strategy = PoolStrategy(CREDENTIAL_POOL_STRATEGY)
+        except ValueError:
+            strategy = PoolStrategy.ROUND_ROBIN
+            logger.warning(f"Invalid pool strategy '{CREDENTIAL_POOL_STRATEGY}', using round_robin")
+        pool = CredentialPool(db_path=TENANT_DB_PATH, strategy=strategy)
+        await pool.initialize()
+        app.state.credential_pool = pool
+        logger.info(f"Credential pool enabled: {pool.active_count} credentials, strategy={strategy.value}")
+
     yield
     
     # Graceful shutdown
     logger.info("Shutting down application...")
+    if CREDENTIAL_POOL_ENABLED and hasattr(app.state, "credential_pool"):
+        try:
+            await app.state.credential_pool.close()
+            logger.info("Credential pool closed")
+        except Exception as e:
+            logger.warning(f"Error closing credential pool: {e}")
     if MULTI_TENANT_ENABLED and hasattr(app.state, "tenant_db"):
         try:
             await app.state.tenant_db.close()

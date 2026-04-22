@@ -17,7 +17,12 @@
       "Bash(kiro-cli --version)",
       "Bash(kiro --version)",
       "Read(//Users/tangqy/**)",
-      "Read(//Users/tangqy/.config/**)"
+      "Read(//Users/tangqy/.config/**)",
+      "Bash(git checkout *)",
+      "Bash(python3 -m py_compile kiro/multi_tenant/credential_pool.py)",
+      "Bash(python3 -m py_compile kiro/multi_tenant/pool_selector.py)",
+      "Bash(python3 -m py_compile kiro/multi_tenant/routes_admin.py)",
+      "Bash(xargs -I {} python3 -m py_compile {})"
     ],
     "additionalDirectories": [
       "/Users/tangqy/workspaces/kiro-gateway/kiro"

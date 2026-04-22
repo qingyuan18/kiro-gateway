@@ -513,6 +513,14 @@ TENANT_DB_PATH: str = os.getenv("TENANT_DB_PATH", "data/tenants.db")
 ADMIN_API_TOKEN: str = os.getenv("ADMIN_API_TOKEN", "")
 
 # ==================================================================================================
+# Credential Pool Settings
+# ==================================================================================================
+
+CREDENTIAL_POOL_ENABLED: bool = os.getenv("CREDENTIAL_POOL_ENABLED", "false").lower() in ("true", "1", "yes")
+
+CREDENTIAL_POOL_STRATEGY: str = os.getenv("CREDENTIAL_POOL_STRATEGY", "round_robin")
+
+# ==================================================================================================
 # Application Version
 # ==================================================================================================
 

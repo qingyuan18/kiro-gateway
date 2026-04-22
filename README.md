@@ -65,6 +65,8 @@ Made with ❤️ by [@Jwadow](https://github.com/jwadow)
 | 🔄 **Retry Logic** | Automatic retries on errors (403, 429, 5xx) |
 | 📋 **Extended model list** | Including versioned models |
 | 🔐 **Smart token management** | Automatic refresh before expiration |
+| 👥 **Multi-Tenant** | Per-user API keys with budget, rate limiting, usage tracking |
+| 🔄 **Credential Pool** | Load-balance across multiple Kiro accounts |
 
 ---
 
@@ -216,7 +218,10 @@ No additional configuration is needed — just point to your credentials file!
 If you use `kiro-cli` and prefer to use its SQLite database directly:
 
 ```env
+# Linux:
 KIRO_CLI_DB_FILE="~/.local/share/kiro-cli/data.sqlite3"
+# macOS:
+KIRO_CLI_DB_FILE="~/Library/Application Support/kiro-cli/data.sqlite3"
 
 # Password to protect YOUR proxy server
 PROXY_API_KEY="my-super-secret-password-123"
@@ -228,10 +233,11 @@ PROXY_API_KEY="my-super-secret-password-123"
 <details>
 <summary>📄 Database locations</summary>
 
-| CLI Tool | Database Path |
-|----------|---------------|
-| kiro-cli | `~/.local/share/kiro-cli/data.sqlite3` |
-| amazon-q-developer-cli | `~/.local/share/amazon-q/data.sqlite3` |
+| CLI Tool | OS | Database Path |
+|----------|-----|---------------|
+| kiro-cli | Linux | `~/.local/share/kiro-cli/data.sqlite3` |
+| kiro-cli | macOS | `~/Library/Application Support/kiro-cli/data.sqlite3` |
+| amazon-q-developer-cli | Linux | `~/.local/share/amazon-q/data.sqlite3` |
 
 The gateway reads credentials from the `auth_kv` table which stores:
 - `kirocli:odic:token` or `codewhisperer:odic:token` — access token, refresh token, expiration
@@ -438,12 +444,15 @@ Add to your `.env` file:
 # Enable multi-tenant mode
 MULTI_TENANT_ENABLED=true
 
-# Admin token for managing tenants (required, make up a secure string)
+# Admin token for managing tenants — YOU make this up, any secure string
+# This is NOT obtained from anywhere, same concept as PROXY_API_KEY
 ADMIN_API_TOKEN="your-admin-secret-token"
 
 # Path to tenant database (optional, default: data/tenants.db)
 # TENANT_DB_PATH="data/tenants.db"
 ```
+
+> **Note:** `ADMIN_API_TOKEN` is a password you **self-define** to protect the admin API. It is NOT an external credential — just pick any strong string.
 
 > **Note:** The original `PROXY_API_KEY` still works as a "master key" even when multi-tenant is enabled.
 
@@ -552,6 +561,92 @@ curl http://localhost:8000/v1/messages \
 
 ---
 
+## 🔄 Credential Pool (Multiple Kiro Accounts)
+
+When a single Kiro account isn't enough (rate limits, multiple teams, redundancy), you can pool multiple Kiro accounts and load-balance requests across them.
+
+### Enable Credential Pool
+
+```env
+# Enable pool mode
+CREDENTIAL_POOL_ENABLED=true
+
+# Multi-tenant must also be enabled (provides admin API + DB)
+MULTI_TENANT_ENABLED=true
+ADMIN_API_TOKEN="your-admin-secret-token"
+
+# Strategy: round_robin (default), least_used, random
+CREDENTIAL_POOL_STRATEGY="round_robin"
+```
+
+### Add Credentials to the Pool
+
+Each credential can be a refresh token, a JSON creds file, or a kiro-cli SQLite DB.
+
+```bash
+# Add credential using refresh token
+curl -X POST http://localhost:8000/admin/pool/credentials \
+  -H "Authorization: Bearer your-admin-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Account A",
+    "cred_type": "refresh_token",
+    "refresh_token": "eyJhbGci...",
+    "region": "us-east-1"
+  }'
+
+# Add credential using JSON file
+curl -X POST http://localhost:8000/admin/pool/credentials \
+  -H "Authorization: Bearer your-admin-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Account B",
+    "cred_type": "creds_file",
+    "creds_file": "/path/to/kiro-auth-token-b.json"
+  }'
+```
+
+### Manage Pool
+
+```bash
+# List all credentials (sensitive fields are masked)
+curl http://localhost:8000/admin/pool/credentials \
+  -H "Authorization: Bearer your-admin-secret-token"
+
+# Disable a credential (stops receiving new requests)
+curl -X PUT http://localhost:8000/admin/pool/credentials/1 \
+  -H "Authorization: Bearer your-admin-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"enabled": 0}'
+
+# Delete a credential
+curl -X DELETE http://localhost:8000/admin/pool/credentials/1 \
+  -H "Authorization: Bearer your-admin-secret-token"
+```
+
+### How It Works
+
+```
+Request ──► Gateway ──► Pool (round-robin / least-used / random)
+                          ├── Kiro Account A (KiroAuthManager #1)
+                          ├── Kiro Account B (KiroAuthManager #2)
+                          └── Kiro Account C (KiroAuthManager #3)
+```
+
+- Each credential gets its own `KiroAuthManager` with independent token refresh
+- The default credential from `.env` (`REFRESH_TOKEN`/`KIRO_CREDS_FILE`) is always available as fallback
+- If the pool is empty, requests automatically fall back to the default credential
+
+### Selection Strategies
+
+| Strategy | Description |
+|----------|-------------|
+| `round_robin` | Rotate through credentials in order (default, even distribution) |
+| `least_used` | Pick the credential with fewest total requests (balanced load) |
+| `random` | Random selection (simple, good enough for small pools) |
+
+---
+
 ## 📡 API Reference
 
 ### Endpoints
@@ -570,6 +665,11 @@ curl http://localhost:8000/v1/messages \
 | `/admin/keys/{key}` | DELETE | Delete a tenant key (admin) |
 | `/admin/keys/{key}/usage` | GET | Query usage for a tenant key (admin) |
 | `/admin/keys/reset-usage` | POST | Reset monthly usage counters (admin) |
+| `/admin/pool/credentials` | GET | List pool credentials (admin) |
+| `/admin/pool/credentials` | POST | Add a credential to the pool (admin) |
+| `/admin/pool/credentials/{id}` | GET | Get pool credential details (admin) |
+| `/admin/pool/credentials/{id}` | PUT | Update a pool credential (admin) |
+| `/admin/pool/credentials/{id}` | DELETE | Remove a credential from pool (admin) |
 
 ---
 

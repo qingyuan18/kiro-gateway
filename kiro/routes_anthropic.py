@@ -144,9 +144,10 @@ async def messages(
     if anthropic_version:
         logger.debug(f"Anthropic-Version header: {anthropic_version}")
     
-    auth_manager: KiroAuthManager = request.app.state.auth_manager
+    from kiro.multi_tenant.pool_selector import get_auth_manager
+    auth_manager: KiroAuthManager = await get_auth_manager(request)
     model_cache: ModelInfoCache = request.app.state.model_cache
-    
+
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
     # This ensures debug logging works even for requests that fail Pydantic validation (422 errors)
     

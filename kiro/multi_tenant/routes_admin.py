@@ -127,3 +127,95 @@ async def reset_monthly_usage(request: Request):
     count = await db.reset_monthly_usage()
     logger.info(f"Monthly usage reset for {count} keys")
     return {"reset_count": count}
+
+
+# ===========================================================================
+# Upstream Credential Pool Management
+# ===========================================================================
+
+class AddCredentialRequest(BaseModel):
+    name: str
+    cred_type: str = "refresh_token"
+    refresh_token: str = ""
+    creds_file: str = ""
+    sqlite_db: str = ""
+    profile_arn: str = ""
+    region: str = "us-east-1"
+
+
+class UpdateCredentialRequest(BaseModel):
+    name: Optional[str] = None
+    refresh_token: Optional[str] = None
+    creds_file: Optional[str] = None
+    sqlite_db: Optional[str] = None
+    profile_arn: Optional[str] = None
+    region: Optional[str] = None
+    enabled: Optional[int] = Field(None, ge=0, le=1)
+
+
+@router.post("/pool/credentials")
+async def add_pool_credential(request: Request, body: AddCredentialRequest):
+    pool = getattr(request.app.state, "credential_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=400, detail="Credential pool is not enabled")
+    cred = await pool.add_credential(
+        name=body.name,
+        cred_type=body.cred_type,
+        refresh_token=body.refresh_token,
+        creds_file=body.creds_file,
+        sqlite_db=body.sqlite_db,
+        profile_arn=body.profile_arn,
+        region=body.region,
+    )
+    logger.info(f"Added pool credential #{cred['id']} ({body.name})")
+    return JSONResponse(status_code=201, content=cred)
+
+
+@router.get("/pool/credentials")
+async def list_pool_credentials(request: Request):
+    pool = getattr(request.app.state, "credential_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=400, detail="Credential pool is not enabled")
+    creds = await pool.list_credentials()
+    return {"credentials": creds, "total": len(creds), "active": pool.active_count, "strategy": pool.strategy.value}
+
+
+@router.get("/pool/credentials/{cred_id}")
+async def get_pool_credential(request: Request, cred_id: int):
+    pool = getattr(request.app.state, "credential_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=400, detail="Credential pool is not enabled")
+    cred = await pool.get_credential(cred_id)
+    if not cred:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    return cred
+
+
+@router.put("/pool/credentials/{cred_id}")
+async def update_pool_credential(request: Request, cred_id: int, body: UpdateCredentialRequest):
+    pool = getattr(request.app.state, "credential_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=400, detail="Credential pool is not enabled")
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        cred = await pool.get_credential(cred_id)
+        if not cred:
+            raise HTTPException(status_code=404, detail="Credential not found")
+        return cred
+    updated = await pool.update_credential(cred_id, **updates)
+    if not updated:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    logger.info(f"Updated pool credential #{cred_id} fields={list(updates.keys())}")
+    return updated
+
+
+@router.delete("/pool/credentials/{cred_id}")
+async def delete_pool_credential(request: Request, cred_id: int):
+    pool = getattr(request.app.state, "credential_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=400, detail="Credential pool is not enabled")
+    deleted = await pool.delete_credential(cred_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Credential not found")
+    logger.info(f"Deleted pool credential #{cred_id}")
+    return {"deleted": True}
