@@ -37,6 +37,7 @@ from loguru import logger
 from kiro.config import (
     PROXY_API_KEY,
     APP_VERSION,
+    MULTI_TENANT_ENABLED,
 )
 from kiro.models_openai import (
     OpenAIModel,
@@ -64,22 +65,26 @@ except ImportError:
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
-async def verify_api_key(auth_header: str = Security(api_key_header)) -> bool:
+async def verify_api_key(request: Request, auth_header: str = Security(api_key_header)) -> bool:
     """
     Verify API key in Authorization header.
-    
-    Expects format: "Bearer {PROXY_API_KEY}"
-    
-    Args:
-        auth_header: Authorization header value
-    
-    Returns:
-        True if key is valid
-    
-    Raises:
-        HTTPException: 401 if key is invalid or missing
+
+    When MULTI_TENANT_ENABLED, validates against tenant database first.
+    Falls back to PROXY_API_KEY check when multi-tenant is disabled or key is the admin key.
     """
-    if not auth_header or auth_header != f"Bearer {PROXY_API_KEY}":
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+    key_value = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else auth_header
+
+    if MULTI_TENANT_ENABLED:
+        from kiro.multi_tenant.tenant_auth import resolve_tenant
+        tenant = await resolve_tenant(request, key_value)
+        if tenant is not None:
+            request.state.tenant_key_info = tenant
+            return True
+
+    if auth_header != f"Bearer {PROXY_API_KEY}":
         logger.warning("Access attempt with invalid API key.")
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return True
@@ -382,13 +387,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
+                last_usage = None
                 try:
                     # Create retry request function for retries
                     async def make_retry_request():
                         return await http_client.request_with_retry(
                             "POST", url, kiro_payload, stream=True
                         )
-                    
+
                     # Use retry wrapper with initial response
                     async for chunk in stream_with_first_token_retry(
                         make_request=make_retry_request,
@@ -400,6 +406,15 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         request_messages=messages_for_tokenizer,
                         request_tools=tools_for_tokenizer
                     ):
+                        if chunk.startswith("data:") and '"usage"' in chunk:
+                            try:
+                                _data = chunk[len("data:"):].strip()
+                                if _data and _data != "[DONE]":
+                                    _parsed = json.loads(_data)
+                                    if "usage" in _parsed:
+                                        last_usage = _parsed["usage"]
+                            except (json.JSONDecodeError, KeyError):
+                                pass
                         yield chunk
                 except GeneratorExit:
                     # Client disconnected - this is normal
@@ -416,6 +431,17 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     raise
                 finally:
                     await http_client.close()
+                    if last_usage and not streaming_error:
+                        try:
+                            from kiro.multi_tenant.usage_tracker import track_request_usage
+                            await track_request_usage(
+                                request,
+                                model=request_data.model,
+                                input_tokens=last_usage.get("prompt_tokens", 0),
+                                output_tokens=last_usage.get("completion_tokens", 0),
+                            )
+                        except Exception as e:
+                            logger.debug(f"Usage tracking skipped: {e}")
                     # Log access log for streaming (success or error)
                     if streaming_error:
                         error_type = type(streaming_error).__name__
@@ -431,7 +457,7 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             debug_logger.flush_on_error(500, str(streaming_error))
                         else:
                             debug_logger.discard_buffers()
-            
+
             return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
         
         else:
@@ -448,14 +474,28 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
             )
             
             await http_client.close()
-            
+
+            # Track usage for tenant
+            usage_data = openai_response.get("usage", {})
+            if usage_data:
+                try:
+                    from kiro.multi_tenant.usage_tracker import track_request_usage
+                    await track_request_usage(
+                        request,
+                        model=request_data.model,
+                        input_tokens=usage_data.get("prompt_tokens", 0),
+                        output_tokens=usage_data.get("completion_tokens", 0),
+                    )
+                except Exception as e:
+                    logger.debug(f"Usage tracking skipped: {e}")
+
             # Log access log for non-streaming success
             logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
-            
+
             # Write debug logs after non-streaming request completes
             if debug_logger:
                 debug_logger.discard_buffers()
-            
+
             return JSONResponse(content=openai_response)
     
     except HTTPException as e:

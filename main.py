@@ -73,6 +73,9 @@ from kiro.config import (
     HIDDEN_FROM_LIST,
     FALLBACK_MODELS,
     VPN_PROXY_URL,
+    MULTI_TENANT_ENABLED,
+    TENANT_DB_PATH,
+    ADMIN_API_TOKEN,
     _warn_timeout_configuration,
 )
 from kiro.auth import KiroAuthManager
@@ -415,11 +418,30 @@ async def lifespan(app: FastAPI):
         logger.debug(f"Model aliases configured: {list(MODEL_ALIASES.keys())}")
     if HIDDEN_FROM_LIST:
         logger.debug(f"Models hidden from list: {HIDDEN_FROM_LIST}")
-    
+
+    # --- Multi-Tenant Initialization ---
+    if MULTI_TENANT_ENABLED:
+        if not ADMIN_API_TOKEN:
+            logger.error("MULTI_TENANT_ENABLED=true but ADMIN_API_TOKEN is not set!")
+            sys.exit(1)
+        from kiro.multi_tenant.database import TenantDatabase
+        from kiro.multi_tenant.rate_limiter import RateLimiter
+        tenant_db = TenantDatabase(db_path=TENANT_DB_PATH)
+        await tenant_db.initialize()
+        app.state.tenant_db = tenant_db
+        app.state.rate_limiter = RateLimiter()
+        logger.info(f"Multi-tenant enabled (db: {TENANT_DB_PATH})")
+
     yield
     
     # Graceful shutdown
     logger.info("Shutting down application...")
+    if MULTI_TENANT_ENABLED and hasattr(app.state, "tenant_db"):
+        try:
+            await app.state.tenant_db.close()
+            logger.info("Tenant database closed")
+        except Exception as e:
+            logger.warning(f"Error closing tenant database: {e}")
     try:
         await app.state.http_client.aclose()
         logger.info("Shared HTTP client closed")
@@ -464,6 +486,11 @@ app.include_router(openai_router)
 
 # Anthropic-compatible API: /v1/messages
 app.include_router(anthropic_router)
+
+# Admin API for multi-tenant management: /admin/keys
+if MULTI_TENANT_ENABLED:
+    from kiro.multi_tenant.routes_admin import router as admin_router
+    app.include_router(admin_router)
 
 
 # --- Uvicorn log config ---

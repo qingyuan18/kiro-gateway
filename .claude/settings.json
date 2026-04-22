@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"from kiro.config import MULTI_TENANT_ENABLED, TENANT_DB_PATH, ADMIN_API_TOKEN; print\\('config OK'\\)\")",
+      "Bash(python3 -c \"from kiro.config import MULTI_TENANT_ENABLED, TENANT_DB_PATH, ADMIN_API_TOKEN; print\\('config OK'\\)\")",
+      "Bash(python3 -m py_compile /Users/tangqy/workspaces/kiro-gateway/kiro/multi_tenant/database.py)",
+      "Bash(python3 -m py_compile /Users/tangqy/workspaces/kiro-gateway/kiro/multi_tenant/pricing.py)",
+      "Bash(python3 -m py_compile /Users/tangqy/workspaces/kiro-gateway/kiro/multi_tenant/rate_limiter.py)",
+      "Bash(python3 -m py_compile /Users/tangqy/workspaces/kiro-gateway/kiro/multi_tenant/tenant_auth.py)",
+      "Bash(python3 -m py_compile /Users/tangqy/workspaces/kiro-gateway/kiro/multi_tenant/routes_admin.py)",
+      "Bash(python3 -m py_compile kiro/config.py)",
+      "Bash(python3 -m py_compile main.py)",
+      "Bash(python3 -m py_compile kiro/routes_openai.py)",
+      "Bash(python3 -m py_compile kiro/routes_anthropic.py)",
+      "Read(//Users/tangqy/.local/share/**)",
+      "Read(//Users/tangqy/.aws/sso/cache/**)",
+      "Bash(kiro-cli --version)",
+      "Bash(kiro --version)",
+      "Read(//Users/tangqy/**)",
+      "Read(//Users/tangqy/.config/**)"
+    ],
+    "additionalDirectories": [
+      "/Users/tangqy/workspaces/kiro-gateway/kiro"
+    ]
+  }
+}

@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from loguru import logger
 
-from kiro.config import PROXY_API_KEY
+from kiro.config import PROXY_API_KEY, MULTI_TENANT_ENABLED
 from kiro.models_anthropic import (
     AnthropicMessagesRequest,
     AnthropicMessagesResponse,
@@ -69,34 +69,30 @@ auth_header = APIKeyHeader(name="Authorization", auto_error=False)
 
 
 async def verify_anthropic_api_key(
+    request: Request,
     x_api_key: Optional[str] = Security(anthropic_api_key_header),
     authorization: Optional[str] = Security(auth_header)
 ) -> bool:
     """
     Verify API key for Anthropic API.
-    
-    Supports two authentication methods:
-    1. x-api-key header (Anthropic native)
-    2. Authorization: Bearer header (for compatibility)
-    
-    Args:
-        x_api_key: Value from x-api-key header
-        authorization: Value from Authorization header
-    
-    Returns:
-        True if key is valid
-    
-    Raises:
-        HTTPException: 401 if key is invalid or missing
+
+    When MULTI_TENANT_ENABLED, validates against tenant database first.
+    Falls back to PROXY_API_KEY check when multi-tenant is disabled.
     """
-    # Check x-api-key first (Anthropic native)
+    key_value = x_api_key or (authorization.replace("Bearer ", "") if authorization and authorization.startswith("Bearer ") else None)
+
+    if MULTI_TENANT_ENABLED and key_value:
+        from kiro.multi_tenant.tenant_auth import resolve_tenant
+        tenant = await resolve_tenant(request, key_value)
+        if tenant is not None:
+            request.state.tenant_key_info = tenant
+            return True
+
     if x_api_key and x_api_key == PROXY_API_KEY:
         return True
-    
-    # Fall back to Authorization: Bearer
     if authorization and authorization == f"Bearer {PROXY_API_KEY}":
         return True
-    
+
     logger.warning("Access attempt with invalid API key (Anthropic endpoint)")
     raise HTTPException(
         status_code=401,
@@ -418,13 +414,15 @@ async def messages(
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
+                tracked_input_tokens = 0
+                tracked_output_tokens = 0
                 try:
                     # Create retry request function for retries
                     async def make_retry_request():
                         return await http_client.request_with_retry(
                             "POST", url, kiro_payload, stream=True
                         )
-                    
+
                     # Use retry wrapper with initial response
                     async for chunk in stream_with_first_token_retry_anthropic(
                         make_request=make_retry_request,
@@ -436,6 +434,22 @@ async def messages(
                         request_tools=tools_for_tokenizer,
                         request_system=system_for_tokenizer,
                     ):
+                        if "message_start" in chunk and '"input_tokens"' in chunk:
+                            try:
+                                for line in chunk.split("\n"):
+                                    if line.startswith("data:"):
+                                        _d = json.loads(line[5:].strip())
+                                        tracked_input_tokens = _d.get("message", {}).get("usage", {}).get("input_tokens", 0)
+                            except (json.JSONDecodeError, KeyError):
+                                pass
+                        if "message_delta" in chunk and '"output_tokens"' in chunk:
+                            try:
+                                for line in chunk.split("\n"):
+                                    if line.startswith("data:"):
+                                        _d = json.loads(line[5:].strip())
+                                        tracked_output_tokens = _d.get("usage", {}).get("output_tokens", 0)
+                            except (json.JSONDecodeError, KeyError):
+                                pass
                         yield chunk
                 except GeneratorExit:
                     client_disconnected = True
@@ -450,6 +464,17 @@ async def messages(
                         pass
                 finally:
                     await http_client.close()
+                    if (tracked_input_tokens or tracked_output_tokens) and not streaming_error:
+                        try:
+                            from kiro.multi_tenant.usage_tracker import track_request_usage
+                            await track_request_usage(
+                                request,
+                                model=request_data.model,
+                                input_tokens=tracked_input_tokens,
+                                output_tokens=tracked_output_tokens,
+                            )
+                        except Exception as e:
+                            logger.debug(f"Usage tracking skipped: {e}")
                     if streaming_error:
                         error_type = type(streaming_error).__name__
                         error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
@@ -458,7 +483,7 @@ async def messages(
                         logger.info(f"HTTP 200 - POST /v1/messages (streaming) - client disconnected")
                     else:
                         logger.info(f"HTTP 200 - POST /v1/messages (streaming) - completed")
-                    
+
                     if debug_logger:
                         if streaming_error:
                             debug_logger.flush_on_error(500, str(streaming_error))
@@ -487,12 +512,28 @@ async def messages(
             )
             
             await http_client.close()
-            
+
+            # Track usage for tenant
+            usage_data = anthropic_response.get("usage", {})
+            if usage_data:
+                try:
+                    from kiro.multi_tenant.usage_tracker import track_request_usage
+                    await track_request_usage(
+                        request,
+                        model=request_data.model,
+                        input_tokens=usage_data.get("input_tokens", 0),
+                        output_tokens=usage_data.get("output_tokens", 0),
+                        cached_tokens=usage_data.get("cache_read_input_tokens", 0),
+                        cache_write_tokens=usage_data.get("cache_creation_input_tokens", 0),
+                    )
+                except Exception as e:
+                    logger.debug(f"Usage tracking skipped: {e}")
+
             logger.info(f"HTTP 200 - POST /v1/messages (non-streaming) - completed")
-            
+
             if debug_logger:
                 debug_logger.discard_buffers()
-            
+
             return JSONResponse(content=anthropic_response)
     
     except HTTPException as e:

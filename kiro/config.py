@@ -502,6 +502,20 @@ WEB_SEARCH_ENABLED: bool = os.getenv("WEB_SEARCH_ENABLED", "true").lower() in ("
 # Application Version
 # ==================================================================================================
 
+# ==================================================================================================
+# Multi-Tenant Settings
+# ==================================================================================================
+
+MULTI_TENANT_ENABLED: bool = os.getenv("MULTI_TENANT_ENABLED", "false").lower() in ("true", "1", "yes")
+
+TENANT_DB_PATH: str = os.getenv("TENANT_DB_PATH", "data/tenants.db")
+
+ADMIN_API_TOKEN: str = os.getenv("ADMIN_API_TOKEN", "")
+
+# ==================================================================================================
+# Application Version
+# ==================================================================================================
+
 APP_VERSION: str = "2.4-dev.7"
 APP_TITLE: str = "Kiro Gateway"
 APP_DESCRIPTION: str = "Proxy gateway for Kiro API (Amazon Q Developer / AWS CodeWhisperer). OpenAI and Anthropic compatible. Made by @jwadow"

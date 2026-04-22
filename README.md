@@ -426,6 +426,132 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 
 ---
 
+## 👥 Multi-Tenant Mode (Virtual Account Management)
+
+Multi-tenant mode enables per-user/team API key management with independent billing, budget control, and rate limiting. This is essential for sharing a single Kiro Gateway deployment across multiple users or teams.
+
+### Enable Multi-Tenant
+
+Add to your `.env` file:
+
+```env
+# Enable multi-tenant mode
+MULTI_TENANT_ENABLED=true
+
+# Admin token for managing tenants (required, make up a secure string)
+ADMIN_API_TOKEN="your-admin-secret-token"
+
+# Path to tenant database (optional, default: data/tenants.db)
+# TENANT_DB_PATH="data/tenants.db"
+```
+
+> **Note:** The original `PROXY_API_KEY` still works as a "master key" even when multi-tenant is enabled.
+
+### Admin API: Manage Tenant Keys
+
+All admin endpoints require `Authorization: Bearer <ADMIN_API_TOKEN>`.
+
+#### Create a new API key
+
+```bash
+curl -X POST http://localhost:8000/admin/keys \
+  -H "Authorization: Bearer your-admin-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Team Alpha",
+    "owner": "alpha@acme.com",
+    "budget_usd": 100,
+    "rate_limit_rpm": 60,
+    "rate_limit_tpm": 100000
+  }'
+```
+
+Response (201):
+```json
+{
+  "id": 1,
+  "key": "sk-kiro-aBcDeFgHiJkLmNoPqRsTuVwXyZ012345",
+  "name": "Team Alpha",
+  "owner": "alpha@acme.com",
+  "budget_usd": 100.0,
+  "used_usd": 0.0,
+  "rate_limit_rpm": 60,
+  "rate_limit_tpm": 100000,
+  "enabled": 1,
+  "created_at": "2026-04-22T10:00:00Z",
+  "last_used_at": null
+}
+```
+
+#### List all keys
+
+```bash
+curl http://localhost:8000/admin/keys \
+  -H "Authorization: Bearer your-admin-secret-token"
+```
+
+#### Update a key (enable/disable, change budget, etc.)
+
+```bash
+curl -X PUT http://localhost:8000/admin/keys/sk-kiro-aBcDeFg... \
+  -H "Authorization: Bearer your-admin-secret-token" \
+  -H "Content-Type: application/json" \
+  -d '{"budget_usd": 200, "enabled": 1}'
+```
+
+#### Delete a key
+
+```bash
+curl -X DELETE http://localhost:8000/admin/keys/sk-kiro-aBcDeFg... \
+  -H "Authorization: Bearer your-admin-secret-token"
+```
+
+#### Query usage for a key
+
+```bash
+curl "http://localhost:8000/admin/keys/sk-kiro-aBcDeFg.../usage?start=2026-04-01&end=2026-04-30" \
+  -H "Authorization: Bearer your-admin-secret-token"
+```
+
+#### Reset monthly usage for all keys
+
+```bash
+curl -X POST http://localhost:8000/admin/keys/reset-usage \
+  -H "Authorization: Bearer your-admin-secret-token"
+```
+
+### Using Tenant Keys
+
+Tenants use their issued `sk-kiro-*` keys exactly the same way as `PROXY_API_KEY`:
+
+```bash
+# OpenAI endpoint
+curl http://localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer sk-kiro-aBcDeFg..." \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet-4-5", "messages": [{"role": "user", "content": "Hello!"}], "stream": true}'
+
+# Anthropic endpoint
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: sk-kiro-aBcDeFg..." \
+  -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model": "claude-sonnet-4-5", "max_tokens": 1024, "messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Per-key budget** | Set monthly USD limit per key; key auto-stops when over budget |
+| **Rate limiting** | RPM (requests/min) and TPM (tokens/min) per key |
+| **Usage tracking** | Input/output/cached tokens logged per request |
+| **Cost calculation** | Automatic cost calculation based on model pricing |
+| **Enable/disable** | Instantly enable or disable any key |
+| **Master key** | `PROXY_API_KEY` always works as super-user |
+
+---
+
 ## 📡 API Reference
 
 ### Endpoints
@@ -437,6 +563,13 @@ Leave `VPN_PROXY_URL` empty (default) if you don't need proxy support.
 | `/v1/models` | GET | List available models |
 | `/v1/chat/completions` | POST | OpenAI Chat Completions API |
 | `/v1/messages` | POST | Anthropic Messages API |
+| `/admin/keys` | GET | List all tenant API keys (admin) |
+| `/admin/keys` | POST | Create a new tenant API key (admin) |
+| `/admin/keys/{key}` | GET | Get tenant key details (admin) |
+| `/admin/keys/{key}` | PUT | Update a tenant key (admin) |
+| `/admin/keys/{key}` | DELETE | Delete a tenant key (admin) |
+| `/admin/keys/{key}/usage` | GET | Query usage for a tenant key (admin) |
+| `/admin/keys/reset-usage` | POST | Reset monthly usage counters (admin) |
 
 ---
 
