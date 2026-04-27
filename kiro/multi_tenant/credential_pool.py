@@ -10,7 +10,7 @@ import asyncio
 import random
 import time
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import aiosqlite
 from loguru import logger
@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS upstream_credentials (
 class CredentialPool:
     """Manages a pool of upstream Kiro credentials with load-balancing."""
 
+    HEALTH_RECOVERY_SECONDS = 300  # unhealthy credentials auto-recover after 5 minutes
+
     def __init__(
         self,
         db_path: str = "data/tenants.db",
@@ -55,6 +57,7 @@ class CredentialPool:
         self.strategy = strategy
         self._db: Optional[aiosqlite.Connection] = None
         self._managers: Dict[int, KiroAuthManager] = {}
+        self._unhealthy: Dict[int, float] = {}  # id -> timestamp when marked unhealthy
         self._robin_index: int = 0
         self._lock = asyncio.Lock()
 
@@ -98,19 +101,48 @@ class CredentialPool:
             sqlite_db=cred.get("sqlite_db") or None,
         )
 
+    # ---- Health ----
+
+    def _recover_healthy(self) -> None:
+        """Auto-recover credentials that have been unhealthy long enough."""
+        now = time.monotonic()
+        recovered = [
+            cid for cid, ts in self._unhealthy.items()
+            if now - ts >= self.HEALTH_RECOVERY_SECONDS
+        ]
+        for cid in recovered:
+            del self._unhealthy[cid]
+            logger.info(f"Pool: credential #{cid} auto-recovered to healthy")
+
+    async def mark_unhealthy(self, cred_id: int) -> None:
+        async with self._lock:
+            self._unhealthy[cred_id] = time.monotonic()
+            logger.warning(f"Pool: credential #{cred_id} marked unhealthy")
+
     # ---- Selection ----
 
-    async def get_manager(self) -> KiroAuthManager:
-        """Select a KiroAuthManager from the pool based on configured strategy.
+    async def get_manager(self, exclude: Optional[Set[int]] = None) -> Tuple[KiroAuthManager, int]:
+        """Select a KiroAuthManager from the pool.
 
-        Falls back to the default (non-pool) manager if the pool is empty.
-        Raises ValueError if no managers are available.
+        Returns (manager, credential_id) tuple.
+        Skips unhealthy and explicitly excluded credentials.
+        Raises ValueError if no healthy managers are available.
         """
         async with self._lock:
             if not self._managers:
                 raise ValueError("No upstream credentials available in pool")
 
-            ids = list(self._managers.keys())
+            self._recover_healthy()
+
+            skip = set(self._unhealthy.keys())
+            if exclude:
+                skip |= exclude
+            ids = [cid for cid in self._managers if cid not in skip]
+
+            if not ids:
+                # All unhealthy — try any as last resort
+                ids = list(self._managers.keys())
+                logger.warning("Pool: all credentials unhealthy, trying any available")
 
             if self.strategy == PoolStrategy.ROUND_ROBIN:
                 chosen_id = ids[self._robin_index % len(ids)]
@@ -127,14 +159,13 @@ class CredentialPool:
             else:  # RANDOM
                 chosen_id = random.choice(ids)
 
-            # Update stats
             await self._db.execute(
                 "UPDATE upstream_credentials SET request_count = request_count + 1, last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') WHERE id = ?",
                 (chosen_id,),
             )
             await self._db.commit()
 
-            return self._managers[chosen_id]
+            return self._managers[chosen_id], chosen_id
 
     # ---- CRUD ----
 

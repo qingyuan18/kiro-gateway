@@ -178,8 +178,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     """
     logger.info(f"Request to /v1/chat/completions (model={request_data.model}, stream={request_data.stream})")
 
-    from kiro.multi_tenant.pool_selector import get_auth_manager
-    auth_manager: KiroAuthManager = await get_auth_manager(request)
+    from kiro.multi_tenant.pool_selector import get_auth_manager_with_failover, should_failover
+    auth_manager, failover_ctx = await get_auth_manager_with_failover(request)
     model_cache: ModelInfoCache = request.app.state.model_cache
     
     # Note: prepare_new_request() and log_request_body() are now called by DebugLoggerMiddleware
@@ -285,88 +285,72 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
     
     # Generate conversation ID for Kiro API (random UUID, not used for tracking)
     conversation_id = generate_conversation_id()
-    
-    # Build payload for Kiro
-    # profileArn is only needed for Kiro Desktop auth
-    # AWS SSO OIDC (Builder ID) users don't need profileArn and it causes 403 if sent
-    profile_arn_for_payload = ""
-    if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
-        profile_arn_for_payload = auth_manager.profile_arn
-    
-    try:
-        kiro_payload = build_kiro_payload(
-            request_data,
-            conversation_id,
-            profile_arn_for_payload
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    
-    # Log Kiro payload
-    try:
-        kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
-        if debug_logger:
-            debug_logger.log_kiro_request_body(kiro_request_body)
-    except Exception as e:
-        logger.warning(f"Failed to log Kiro request: {e}")
-    
-    # Create HTTP client with retry logic
-    # For streaming: use per-request client to avoid CLOSE_WAIT leak on VPN disconnect (issue #54)
-    # For non-streaming: use shared client for connection pooling
-    url = f"{auth_manager.api_host}/generateAssistantResponse"
-    logger.debug(f"Kiro API URL: {url}")
-    
-    if request_data.stream:
-        # Streaming mode: per-request client prevents orphaned connections
-        # when network interface changes (VPN disconnect/reconnect)
-        http_client = KiroHttpClient(auth_manager, shared_client=None)
-    else:
-        # Non-streaming mode: shared client for efficient connection reuse
-        shared_client = request.app.state.http_client
-        http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
-    try:
-        # Make request to Kiro API (for both streaming and non-streaming modes)
-        # Important: we wait for Kiro response BEFORE returning StreamingResponse,
-        # so that 200 OK means Kiro accepted the request and started responding
+
+    # --- Kiro API request with credential failover ---
+    last_error_response = None
+    while True:
+        profile_arn_for_payload = ""
+        if auth_manager.auth_type == AuthType.KIRO_DESKTOP and auth_manager.profile_arn:
+            profile_arn_for_payload = auth_manager.profile_arn
+
+        try:
+            kiro_payload = build_kiro_payload(
+                request_data,
+                conversation_id,
+                profile_arn_for_payload
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        try:
+            kiro_request_body = json.dumps(kiro_payload, ensure_ascii=False, indent=2).encode('utf-8')
+            if debug_logger:
+                debug_logger.log_kiro_request_body(kiro_request_body)
+        except Exception as e:
+            logger.warning(f"Failed to log Kiro request: {e}")
+
+        url = f"{auth_manager.api_host}/generateAssistantResponse"
+        logger.debug(f"Kiro API URL: {url}")
+
+        if request_data.stream:
+            http_client = KiroHttpClient(auth_manager, shared_client=None)
+        else:
+            shared_client = request.app.state.http_client
+            http_client = KiroHttpClient(auth_manager, shared_client=shared_client)
+
         response = await http_client.request_with_retry(
-            "POST",
-            url,
-            kiro_payload,
-            stream=True
+            "POST", url, kiro_payload, stream=True
         )
-        
+
         if response.status_code != 200:
             try:
                 error_content = await response.aread()
             except Exception:
                 error_content = b"Unknown error"
-            
             await http_client.close()
             error_text = error_content.decode('utf-8', errors='replace')
-            
-            # Try to parse JSON response from Kiro to extract error message
+
             error_message = error_text
             try:
                 error_json = json.loads(error_text)
-                # Enhance Kiro API errors with user-friendly messages
                 from kiro.kiro_errors import enhance_kiro_error
                 error_info = enhance_kiro_error(error_json)
                 error_message = error_info.user_message
-                # Log original error for debugging
                 logger.debug(f"Original Kiro error: {error_info.original_message} (reason: {error_info.reason})")
             except (json.JSONDecodeError, KeyError):
                 pass
-            
-            # Log access log for error (before flush, so it gets into app_logs)
-            logger.warning(
-                f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}"
-            )
-            
-            # Flush debug logs on error ("errors" mode)
+
+            # Credential failover: try next credential on 401/403
+            if should_failover(response.status_code) and failover_ctx and failover_ctx.can_retry:
+                next_manager = await failover_ctx.mark_failed_and_get_next()
+                if next_manager is not None:
+                    auth_manager = next_manager
+                    continue  # retry with new credential
+
+            logger.warning(f"HTTP {response.status_code} - POST /v1/chat/completions - {error_message[:100]}")
             if debug_logger:
                 debug_logger.flush_on_error(response.status_code, error_message)
-            
-            # Return error in OpenAI API format
+
             return JSONResponse(
                 status_code=response.status_code,
                 content={
@@ -377,26 +361,25 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                     }
                 }
             )
-        
-        # Prepare data for fallback token counting
-        # Convert Pydantic models to dicts for tokenizer
-        messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
-        tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
-        
+
+        break  # success — exit the failover loop
+
+    # Prepare data for fallback token counting
+    messages_for_tokenizer = [msg.model_dump() for msg in request_data.messages]
+    tools_for_tokenizer = [tool.model_dump() for tool in request_data.tools] if request_data.tools else None
+
+    try:
         if request_data.stream:
-            # Streaming mode with first token retry
             async def stream_wrapper():
                 streaming_error = None
                 client_disconnected = False
                 last_usage = None
                 try:
-                    # Create retry request function for retries
                     async def make_retry_request():
                         return await http_client.request_with_retry(
                             "POST", url, kiro_payload, stream=True
                         )
 
-                    # Use retry wrapper with initial response
                     async for chunk in stream_with_first_token_retry(
                         make_request=make_retry_request,
                         client=http_client.client,
@@ -418,17 +401,14 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                                 pass
                         yield chunk
                 except GeneratorExit:
-                    # Client disconnected - this is normal
                     client_disconnected = True
                     logger.debug("Client disconnected during streaming (GeneratorExit in routes)")
                 except Exception as e:
                     streaming_error = e
-                    # Try to send [DONE] to client before finishing
-                    # so client doesn't "hang" waiting for data
                     try:
                         yield "data: [DONE]\n\n"
                     except Exception:
-                        pass  # Client already disconnected
+                        pass
                     raise
                 finally:
                     await http_client.close()
@@ -443,7 +423,6 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             )
                         except Exception as e:
                             logger.debug(f"Usage tracking skipped: {e}")
-                    # Log access log for streaming (success or error)
                     if streaming_error:
                         error_type = type(streaming_error).__name__
                         error_msg = str(streaming_error) if str(streaming_error) else "(empty message)"
@@ -452,7 +431,6 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - client disconnected")
                     else:
                         logger.info(f"HTTP 200 - POST /v1/chat/completions (streaming) - completed")
-                    # Write debug logs AFTER streaming completes
                     if debug_logger:
                         if streaming_error:
                             debug_logger.flush_on_error(500, str(streaming_error))
@@ -460,10 +438,8 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                             debug_logger.discard_buffers()
 
             return StreamingResponse(stream_wrapper(), media_type="text/event-stream")
-        
+
         else:
-            
-            # Non-streaming mode - collect entire response
             openai_response = await collect_stream_response(
                 http_client.client,
                 response,
@@ -473,10 +449,9 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 request_messages=messages_for_tokenizer,
                 request_tools=tools_for_tokenizer
             )
-            
+
             await http_client.close()
 
-            # Track usage for tenant
             usage_data = openai_response.get("usage", {})
             if usage_data:
                 try:
@@ -490,29 +465,23 @@ async def chat_completions(request: Request, request_data: ChatCompletionRequest
                 except Exception as e:
                     logger.debug(f"Usage tracking skipped: {e}")
 
-            # Log access log for non-streaming success
             logger.info(f"HTTP 200 - POST /v1/chat/completions (non-streaming) - completed")
 
-            # Write debug logs after non-streaming request completes
             if debug_logger:
                 debug_logger.discard_buffers()
 
             return JSONResponse(content=openai_response)
-    
+
     except HTTPException as e:
         await http_client.close()
-        # Log access log for HTTP error
         logger.error(f"HTTP {e.status_code} - POST /v1/chat/completions - {e.detail}")
-        # Flush debug logs on HTTP error ("errors" mode)
         if debug_logger:
             debug_logger.flush_on_error(e.status_code, str(e.detail))
         raise
     except Exception as e:
         await http_client.close()
         logger.error(f"Internal error: {e}", exc_info=True)
-        # Log access log for internal error
         logger.error(f"HTTP 500 - POST /v1/chat/completions - {str(e)[:100]}")
-        # Flush debug logs on internal error ("errors" mode)
         if debug_logger:
             debug_logger.flush_on_error(500, str(e))
         raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")

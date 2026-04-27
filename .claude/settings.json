@@ -22,7 +22,15 @@
       "Bash(python3 -m py_compile kiro/multi_tenant/credential_pool.py)",
       "Bash(python3 -m py_compile kiro/multi_tenant/pool_selector.py)",
       "Bash(python3 -m py_compile kiro/multi_tenant/routes_admin.py)",
-      "Bash(xargs -I {} python3 -m py_compile {})"
+      "Bash(xargs -I {} python3 -m py_compile {})",
+      "Bash(sqlite3 /Users/tangqy/workspaces/kiro-gateway/data/test_tenants.db \".tables\")",
+      "Bash(sqlite3 /Users/tangqy/workspaces/kiro-gateway/data/test_tenants.db \"SELECT * FROM api_keys;\")",
+      "Bash(sqlite3 /Users/tangqy/workspaces/kiro-gateway/data/test_tenants.db \"SELECT * FROM upstream_credentials;\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('kiro/routes_anthropic.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('kiro/routes_openai.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('kiro/multi_tenant/pool_selector.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('kiro/multi_tenant/credential_pool.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python3 -c \"import py_compile; py_compile.compile\\('kiro/routes_anthropic.py', doraise=True\\); py_compile.compile\\('kiro/routes_openai.py', doraise=True\\); py_compile.compile\\('kiro/multi_tenant/pool_selector.py', doraise=True\\); py_compile.compile\\('kiro/multi_tenant/credential_pool.py', doraise=True\\); print\\('All files compile OK'\\)\")"
     ],
     "additionalDirectories": [
       "/Users/tangqy/workspaces/kiro-gateway/kiro"
