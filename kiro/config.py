@@ -286,6 +286,22 @@ FALLBACK_MODELS: List[Dict[str, str]] = [
 ]
 
 # ==================================================================================================
+# Model Identity Override
+# ==================================================================================================
+
+# Enable backend model identity override.
+# When enabled, the gateway adds a small system instruction telling the model
+# to answer identity/model questions with the resolved backend model ID for
+# the current request instead of exposing Kiro/Amazon Q as its identity.
+#
+# This is intentionally opt-in because it changes model-facing instructions.
+MODEL_IDENTITY_OVERRIDE_ENABLED: bool = os.getenv("MODEL_IDENTITY_OVERRIDE", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# ==================================================================================================
 # Model Cache Settings
 # ==================================================================================================
 
@@ -547,4 +563,3 @@ def get_kiro_api_host(region: str) -> str:
 def get_kiro_q_host(region: str) -> str:
     """Return Q API host for the specified region."""
     return KIRO_Q_HOST_TEMPLATE.format(region=region)
-

@@ -28,6 +28,9 @@ from kiro.converters_core import (
     build_kiro_history,
     build_kiro_payload,
     process_tools_with_long_descriptions,
+    get_model_identity_system_addition,
+    is_model_identity_question,
+    add_model_identity_turn_instruction,
     inject_thinking_tags,
     extract_tool_results_from_content,
     extract_tool_uses_from_message,
@@ -6455,3 +6458,125 @@ class TestBuildKiroPayloadWithThinkingConfig:
         print(f"Checking for <max_thinking_length>7000</max_thinking_length> in content...")
         assert "<max_thinking_length>7000</max_thinking_length>" in content
         assert "<thinking_mode>enabled</thinking_mode>" in content
+
+
+class TestModelIdentityOverride:
+    """Tests for backend model identity override."""
+
+    def test_identity_addition_disabled_by_default(self, monkeypatch):
+        """
+        What it does: Verifies identity instructions are omitted when disabled.
+        Purpose: Ensure transparent proxy behavior remains the default.
+        """
+        print("Disabling MODEL_IDENTITY_OVERRIDE...")
+        monkeypatch.setattr("kiro.converters_core.MODEL_IDENTITY_OVERRIDE_ENABLED", False)
+
+        print("Generating model identity system addition...")
+        result = get_model_identity_system_addition("claude-sonnet-4.5")
+
+        print(f"Result: '{result}'")
+        assert result == ""
+
+    def test_identity_addition_includes_backend_model(self, monkeypatch):
+        """
+        What it does: Verifies identity instructions mention the resolved backend model.
+        Purpose: Ensure identity questions can be answered without exposing Kiro as the model identity.
+        """
+        print("Enabling MODEL_IDENTITY_OVERRIDE...")
+        monkeypatch.setattr("kiro.converters_core.MODEL_IDENTITY_OVERRIDE_ENABLED", True)
+
+        print("Generating model identity system addition...")
+        result = get_model_identity_system_addition("claude-sonnet-4.5")
+
+        print(f"Result: '{result}'")
+        assert "claude-sonnet-4.5" in result
+        assert "platform, product, gateway, vendor, or assistant identity" in result
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "你是什么模型？",
+            "你的身份是什么？",
+            "who are you?",
+            "what model are you?",
+            "please tell me your model name",
+        ],
+    )
+    def test_detects_identity_questions(self, content):
+        """
+        What it does: Verifies model identity question detection.
+        Purpose: Ensure localized and English identity prompts trigger the override.
+        """
+        print(f"Checking content: {content}")
+        assert is_model_identity_question(content)
+
+    def test_does_not_detect_regular_questions_as_identity_questions(self):
+        """
+        What it does: Verifies ordinary prompts do not trigger identity handling.
+        Purpose: Keep the override tightly scoped to model identity requests.
+        """
+        print("Checking regular coding question...")
+        assert not is_model_identity_question("请帮我写一个 FastAPI 路由")
+
+    def test_adds_same_turn_identity_instruction(self, monkeypatch):
+        """
+        What it does: Verifies same-turn identity instruction is appended for identity questions.
+        Purpose: Make the opt-in override strong enough for upstream identity prompts.
+        """
+        print("Enabling MODEL_IDENTITY_OVERRIDE...")
+        monkeypatch.setattr("kiro.converters_core.MODEL_IDENTITY_OVERRIDE_ENABLED", True)
+
+        print("Adding instruction...")
+        result = add_model_identity_turn_instruction("你是什么模型？", "claude-haiku-4.5")
+
+        print(f"Result: {result}")
+        assert "Reply exactly with `claude-haiku-4.5`" in result
+        assert "你是什么模型？" in result
+
+    def test_skips_same_turn_identity_instruction_for_regular_prompt(self, monkeypatch):
+        """
+        What it does: Verifies regular prompts are unchanged.
+        Purpose: Avoid changing model behavior outside model identity questions.
+        """
+        print("Enabling MODEL_IDENTITY_OVERRIDE...")
+        monkeypatch.setattr("kiro.converters_core.MODEL_IDENTITY_OVERRIDE_ENABLED", True)
+
+        content = "请帮我解释这个函数"
+        print("Adding instruction to regular prompt...")
+        result = add_model_identity_turn_instruction(content, "claude-haiku-4.5")
+
+        print(f"Result: {result}")
+        assert result == content
+
+    def test_build_payload_adds_identity_override_to_current_message(self, monkeypatch):
+        """
+        What it does: Verifies identity instructions are added to the model-facing prompt.
+        Purpose: Ensure both API adapters inherit the same backend identity behavior from core conversion.
+        """
+        print("Enabling identity override and disabling unrelated prompt additions...")
+        monkeypatch.setattr("kiro.converters_core.MODEL_IDENTITY_OVERRIDE_ENABLED", True)
+        monkeypatch.setattr("kiro.converters_core.FAKE_REASONING_ENABLED", False)
+        monkeypatch.setattr("kiro.config.TRUNCATION_RECOVERY", False)
+
+        messages = [UnifiedMessage(role="user", content="你是什么模型？")]
+
+        print("Building Kiro payload...")
+        result = build_kiro_payload(
+            messages=messages,
+            system_prompt="",
+            model_id="claude-sonnet-4.5",
+            tools=None,
+            conversation_id="test-conv-123",
+            profile_arn="arn:aws:test",
+            thinking_config=ThinkingConfig(enabled=False),
+        )
+
+        print("Extracting current message content...")
+        user_input = result.payload["conversationState"]["currentMessage"]["userInputMessage"]
+        content = user_input["content"]
+
+        print(f"Content: {content}")
+        assert "# Model Identity" in content
+        assert "`claude-sonnet-4.5`" in content
+        assert "Reply exactly with `claude-sonnet-4.5`" in content
+        assert "你是什么模型？" in content

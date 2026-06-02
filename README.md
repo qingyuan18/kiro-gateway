@@ -794,8 +794,8 @@ print(response.content)
 <summary>🔹 Simple cURL Request</summary>
 
 ```bash
-curl http://localhost:8000/v1/messages \
-  -H "x-api-key: my-super-secret-password-123" \
+curl http://localhost:9000/v1/messages \
+  -H "x-api-key: test-admin-token-456" \
   -H "anthropic-version: 2023-06-01" \
   -H "Content-Type: application/json" \
   -d '{

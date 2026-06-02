@@ -53,6 +53,10 @@ from kiro.http_client import KiroHttpClient
 from kiro.utils import generate_conversation_id
 from kiro.config import WEB_SEARCH_ENABLED
 from kiro.mcp_tools import handle_native_web_search
+from kiro.identity_override import (
+    normalize_anthropic_identity_response,
+    should_normalize_identity_response,
+)
 
 # Import debug_logger
 try:
@@ -495,6 +499,11 @@ async def messages(
                 request_messages=messages_for_tokenizer,
                 request_tools=tools_for_tokenizer,
                 request_system=system_for_tokenizer,
+            )
+            anthropic_response = normalize_anthropic_identity_response(
+                anthropic_response,
+                request_data.model,
+                request_data.messages,
             )
             
             await http_client.close()

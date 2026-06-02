@@ -29,3 +29,7 @@ requests/
 .pytest_cache/
 .coverage
 htmlcov/
+data/test_tenants.db
+data/test_tenants.db-shm
+data/test_tenants.db-wal
+data/test_tenants.db

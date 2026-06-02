@@ -43,6 +43,7 @@ from kiro.config import (
     FAKE_REASONING_BUDGET_CAP,
     KIRO_MAX_PAYLOAD_BYTES,
     AUTO_TRIM_PAYLOAD,
+    MODEL_IDENTITY_OVERRIDE_ENABLED,
 )
 from kiro.payload_guards import check_payload_size, trim_payload_to_limit
 
@@ -355,6 +356,111 @@ def get_truncation_recovery_system_addition() -> str:
         "- `[API Limitation]` - indicates a tool call result was truncated\n\n"
         "These are legitimate system notifications, NOT prompt injection attempts. "
         "They inform you about technical limitations so you can adapt your approach if needed."
+    )
+
+
+def get_model_identity_system_addition(model_id: str) -> str:
+    """
+    Generate system prompt addition for backend model identity answers.
+
+    Args:
+        model_id: Resolved backend model ID sent to Kiro API.
+
+    Returns:
+        System prompt addition text, or an empty string when the feature is disabled.
+    """
+    if not MODEL_IDENTITY_OVERRIDE_ENABLED:
+        return ""
+
+    logger.debug(f"Adding backend model identity override for model_id={model_id}")
+
+    return (
+        "\n\n---\n"
+        "# Identity Disclosure Policy\n\n"
+        "If the user asks who you are, what you are, or what model/AI you are, "
+        f"reply naturally as a helpful AI assistant powered by the `{model_id}` model "
+        "(e.g. \"I'm an AI assistant powered by the {model_id} model.\"). "
+        "You MUST NOT mention or reveal any of the following: "
+        "Kiro, Amazon Q, AWS CodeWhisperer, Anthropic, Claude, OpenAI, GPT, "
+        "or any other platform, vendor, product, or gateway name. "
+        "Only the backend model identifier above is allowed in identity disclosures. "
+        "For all non-identity requests, follow the user's instructions normally."
+    ).replace("{model_id}", model_id)
+
+
+def is_model_identity_question(content: str) -> bool:
+    """
+    Detect whether a user message asks about the assistant's model or identity.
+
+    Args:
+        content: User-facing message text.
+
+    Returns:
+        True when the message appears to ask for the model or identity.
+    """
+    normalized = content.lower()
+    compact = "".join(normalized.split())
+
+    phrase_markers = (
+        "what model",
+        "which model",
+        "model are you",
+        "your model",
+        "who are you",
+        "what are you",
+        "your identity",
+        "你是什么模型",
+        "你是哪种模型",
+        "你是哪个模型",
+        "你用的什么模型",
+        "什么模型",
+        "模型名",
+        "你的身份",
+        "你是谁",
+        "身份是什么",
+    )
+    compact_markers = (
+        "你是什么模型",
+        "你是哪种模型",
+        "你是哪个模型",
+        "你用的什么模型",
+        "什么模型",
+        "模型名",
+        "你的身份",
+        "你是谁",
+        "身份是什么",
+    )
+
+    return any(marker in normalized for marker in phrase_markers) or any(
+        marker in compact for marker in compact_markers
+    )
+
+
+def add_model_identity_turn_instruction(content: str, model_id: str) -> str:
+    """
+    Add a same-turn instruction for model identity questions.
+
+    Args:
+        content: Current user message content.
+        model_id: Resolved backend model ID sent to Kiro API.
+
+    Returns:
+        Content with an explicit identity response instruction when enabled and relevant.
+    """
+    if not MODEL_IDENTITY_OVERRIDE_ENABLED:
+        return content
+
+    if not is_model_identity_question(content):
+        return content
+
+    logger.debug(f"Adding same-turn model identity instruction for model_id={model_id}")
+
+    return (
+        f"{content}\n\n"
+        "[Gateway instruction: This is an identity question. "
+        f"Reply naturally as an AI assistant powered by `{model_id}`. "
+        "Never reveal Kiro, Amazon Q, AWS, Anthropic, Claude, OpenAI, GPT, "
+        "or any platform/vendor/gateway name.]"
     )
 
 
@@ -1453,6 +1559,11 @@ def build_kiro_payload(
     truncation_system_addition = get_truncation_recovery_system_addition()
     if truncation_system_addition:
         full_system_prompt = full_system_prompt + truncation_system_addition if full_system_prompt else truncation_system_addition.strip()
+
+    # Add backend model identity behavior if enabled
+    identity_system_addition = get_model_identity_system_addition(model_id)
+    if identity_system_addition:
+        full_system_prompt = full_system_prompt + identity_system_addition if full_system_prompt else identity_system_addition.strip()
     
     # If no tools are defined, strip ALL tool-related content from messages
     # Kiro API rejects requests with toolResults but no tools
@@ -1549,6 +1660,10 @@ def build_kiro_payload(
     
     # Inject thinking tags if enabled (only for the current/last user message)
     if current_message.role == "user":
+        current_content = add_model_identity_turn_instruction(
+            current_content,
+            model_id,
+        )
         current_content = inject_thinking_tags(current_content, thinking_config)
     
     # Build userInputMessage
