@@ -9,7 +9,10 @@ from fastapi.security import APIKeyHeader
 from loguru import logger
 from pydantic import BaseModel, Field
 
+import httpx
+
 from kiro.config import ADMIN_API_TOKEN
+from kiro.upstream_usage import fetch_upstream_usage
 
 # --- Security ---
 admin_key_header = APIKeyHeader(name="Authorization", auto_error=False)
@@ -219,3 +222,72 @@ async def delete_pool_credential(request: Request, cred_id: int):
         raise HTTPException(status_code=404, detail="Credential not found")
     logger.info(f"Deleted pool credential #{cred_id}")
     return {"deleted": True}
+
+
+# ===========================================================================
+# Upstream Kiro Account Usage
+# ===========================================================================
+
+
+def _handle_upstream_usage_error(exc: Exception) -> JSONResponse:
+    if isinstance(exc, httpx.HTTPStatusError):
+        return JSONResponse(
+            status_code=exc.response.status_code,
+            content={"error": "upstream_error", "detail": exc.response.text[:500]},
+        )
+    if isinstance(exc, httpx.HTTPError):
+        return JSONResponse(status_code=502, content={"error": "upstream_unreachable", "detail": str(exc)})
+    return JSONResponse(status_code=500, content={"error": "internal", "detail": str(exc)})
+
+
+@router.get("/upstream/usage")
+async def get_upstream_usage(request: Request):
+    """Return usage limits for the default upstream Kiro account."""
+    auth_manager = getattr(request.app.state, "auth_manager", None)
+    if auth_manager is None:
+        raise HTTPException(status_code=400, detail="Default upstream auth manager not configured")
+    try:
+        data = await fetch_upstream_usage(auth_manager)
+    except Exception as e:
+        logger.error(f"Failed to fetch upstream usage: {e}")
+        return _handle_upstream_usage_error(e)
+    return data
+
+
+@router.get("/pool/credentials/{cred_id}/usage")
+async def get_pool_credential_usage(request: Request, cred_id: int):
+    """Return upstream Kiro usage limits for a specific pooled credential."""
+    pool = getattr(request.app.state, "credential_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=400, detail="Credential pool is not enabled")
+    manager = pool._managers.get(cred_id)
+    if manager is None:
+        raise HTTPException(status_code=404, detail="Credential not found or disabled")
+    try:
+        data = await fetch_upstream_usage(manager)
+    except Exception as e:
+        logger.error(f"Failed to fetch upstream usage for credential #{cred_id}: {e}")
+        return _handle_upstream_usage_error(e)
+    return data
+
+
+@router.get("/pool/usage")
+async def get_pool_usage_all(request: Request):
+    """Return upstream Kiro usage for every credential in the pool."""
+    pool = getattr(request.app.state, "credential_pool", None)
+    if pool is None:
+        raise HTTPException(status_code=400, detail="Credential pool is not enabled")
+
+    results = []
+    for cred_id, manager in pool._managers.items():
+        entry: dict = {"credential_id": cred_id}
+        try:
+            entry["usage"] = await fetch_upstream_usage(manager)
+        except httpx.HTTPStatusError as e:
+            entry["error"] = {"status": e.response.status_code, "detail": e.response.text[:300]}
+        except httpx.HTTPError as e:
+            entry["error"] = {"status": 502, "detail": str(e)}
+        except Exception as e:
+            entry["error"] = {"status": 500, "detail": str(e)}
+        results.append(entry)
+    return {"credentials": results, "total": len(results)}
